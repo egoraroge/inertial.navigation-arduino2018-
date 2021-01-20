@@ -1,0 +1,309 @@
+#include <util/delay.h> // подключаем библиотеку задержек
+#include <LiquidCrystal.h> // библиотека для дисплея
+LiquidCrystal lcd(13, 12, 9, 8, 3, 2); // (RS, E, DB4, DB5, DB6, DB7)
+
+#define F_CP  16000000 // тактовая частота процессора
+#define F_PWM_for_motors 1000 // частота ШИМ для моторов (1000 Гц)
+#include <avr/interrupt.h> // библиотека для работы с прерывниями
+#include "timer-api.h"
+
+#define ger 2
+#define ger2 3
+
+#include<Wire.h> //гироскоп и аксель
+const int MPU_addr=0x68;  // I2C address of the MPU-6050
+int16_t AcX,AcY,AcZ,Tmp,GyX,GyY,GyZFIRST,GyZSECOND;
+const byte averageFactor=10; // переменная для сглаживания
+int GyZC = 0;//показания с сенсора
+int OneWhell=2*3.14; // треть колеса(0,666*пr)
+int DistanceX0=0; int DistanceY0=0; //  проекции перемещений
+int DistanceX=0; int DistanceY=0; //  проекции перемещений
+int DistanceXNEC=0; int DistanceYNEC=0; // проекции перемещений (сохращение значений)
+int GyzNEC=0;// угол для постановки на необходимый радиус-вектор
+
+//константы для датчика 
+const float vref = 3.3;
+const float vzero = 1.23;
+const float sens = 0.0005;
+const float adc = 1023;
+const int INTEGR_DELAY = 20;
+const int SERIAL_DELAY = 100;
+
+const int gyrPin = A4;
+int time;
+int integr_time, real_delta;
+short gyr_raw;
+float angle, aspeed;
+
+int integr_timer, real_delta_timer;
+short gyr_raw_timer;
+float angle_timer, aspeed_timer;
+
+int LCD_COUNT_ANDLE [50]; // массивы для записи пройденных расстояний и углов
+int LCD_COUNT_DIS [50];
+int COUNT_DIS_ANDLE =0; // переменная для счета препятствий (количества отрезков на каждом из которых измеряется угол и расстояние)
+int OUTPUT_ANDLE_DIS=0; // переменная для вывода отрезков по одному
+
+volatile int n1=0; // счётчик импульсов для левого геркона
+volatile int n2=0; // счётчик импульсов для правого геркона
+
+unsigned char volatile FLAG_of_direct_1 = 0; // переменная-флаг для указания текущего направления вращения мотора (левого), 0-вперёд, 1-назад
+unsigned char volatile FLAG_of_direct_2 = 0; // переменная-флаг для указания текущего направления вращения мотора (правого), 0-вперёд, 1-назад
+
+int enA = 11;
+int enB = 10;
+
+int LeftForvard  = 7; // левый мотор назад
+int LeftBack  =6; // левый мотор вперёд
+int RightBack  =5; // правый мотор назад
+int RightForvard  =4; // правый мотор вперёд
+
+ISR(INT1_vect) {
+   if(FLAG_of_direct_1 = 0){
+      n1=n1+1;
+   }
+   else {
+      n1=n1-1;
+   } 
+}
+
+ISR(INT0_vect) {
+     if(FLAG_of_direct_2 = 0){
+      n2=n2+1;
+   }
+   else {
+      n2=n2-1;
+   }
+}
+
+
+void setup() {
+  
+  pinMode(enA, OUTPUT);
+  pinMode(enB, OUTPUT);
+  
+  pinMode(LeftBack, OUTPUT); // инициализация пинов для упраления драйвером моторов
+  pinMode(LeftForvard, OUTPUT);
+  pinMode(RightBack, OUTPUT);
+  pinMode(RightForvard, OUTPUT);
+
+
+  // инициализация внешних прерываний
+  EICRA = (1<<ISC11)|(0<<ISC10)|(1<<ISC01)|(0<<ISC00); // прерывания по заднему фронту на обоих входах
+  EIMSK = (1<<INT1)|(1<<INT0); // разрешаем оба внешних прерывания
+
+  timer_init_ISR_1Hz(TIMER_DEFAULT);// частота=1Гц Внутренние прерывания по таймеру
+    
+  Wire.begin(); // гироскоп и аксель
+  Wire.beginTransmission(MPU_addr);
+  Wire.write(0x6B);  // PWR_MGMT_1 register
+  Wire.write(0);     // set to zero (wakes up the MPU-6050)
+  Wire.endTransmission(true);
+  
+  Serial.begin (9600); // подключаем монитор порта
+
+  pinMode(A0,INPUT); //FULeft //инфракрасные датчики
+  digitalWrite (A0,HIGH);
+  pinMode(A2,INPUT);//FULCentre
+  digitalWrite (A2,HIGH);
+  pinMode(A1,INPUT);//FURCentre
+  digitalWrite (A1,HIGH);
+  pinMode(A3,INPUT);//FURight
+  digitalWrite (A3,HIGH);
+
+  angle = 0;
+
+  sei(); // разрешаем внешние прерывния
+  
+  lcd.begin(16, 2);
+}
+
+void timer_handle_interrupts(int timer) {  //внутренние прерывания по таймеру для счета проекций
+    static unsigned long prev_time = 0;
+    
+    unsigned long _time = micros();
+    unsigned long _period = _time - prev_time;
+    prev_time = _time;
+    
+   Wire.beginTransmission(MPU_addr);      // блок измерения угла и проекций
+   Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+   Wire.endTransmission(false);
+   Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
+   GyZFIRST=Wire.read()<<8|Wire.read();  // 0x47 (GYRO_ZOUT_H) & 0x48 (GYRO_ZOUT_L)
+   
+    time = millis();
+    real_delta_timer = time - integr_timer;
+    if( real_delta > INTEGR_DELAY ){
+        integr_timer = time;
+        gyr_raw_timer = GyZFIRST;
+        aspeed_timer = ((gyr_raw_timer * vref)/adc - vzero)/sens;
+        angle_timer = angle_timer + aspeed_timer * real_delta_timer;
+    }                                 
+   
+   DistanceY=DistanceY + OneWhell/(sin (angle*3.14/180));
+   DistanceX=DistanceX + OneWhell/(cos (angle*3.14/180));
+   
+    Serial.print("timer: ");
+    Serial.println(_period, DEC);
+}
+
+void motors_forward() { // процедура запуска мотов вперёд
+  FLAG_of_direct_1 = 0; // левый мотор вращается вперёд
+  FLAG_of_direct_2 = 0; // правый мотор вращается вперёд
+  digitalWrite(LeftForvard, HIGH);
+  digitalWrite(RightBack, LOW);
+  digitalWrite(LeftBack, LOW);
+  digitalWrite(RightForvard, HIGH);
+}
+
+void motors_back() { // процедура запуска моторов назад
+  FLAG_of_direct_1 = 1; // левый мотор вращается назад
+  FLAG_of_direct_2 = 1; // правый мотор вращается назад
+  digitalWrite(RightForvard, LOW);
+  digitalWrite(RightBack, HIGH);
+  digitalWrite(LeftBack, HIGH);
+  digitalWrite(LeftForvard, LOW);
+}
+
+void left_rotate() { // процедура повора налево
+  FLAG_of_direct_1 = 0; // левый мотор вращается вперёд
+  FLAG_of_direct_2 = 1; // правый мотор вращается назад
+  digitalWrite(RightForvard, HIGH);
+  digitalWrite(LeftForvard, LOW);
+  digitalWrite(LeftBack, HIGH);
+  digitalWrite(RightBack, LOW);
+}
+
+void right_rotate() { // процедура поворота направо правый геркон- второй
+  FLAG_of_direct_1 = 1; // левый мотор вращается назад
+  FLAG_of_direct_2 = 0; // правый мотор вращается вперёд
+  digitalWrite(RightBack, HIGH);
+  digitalWrite(RightForvard, LOW);
+  digitalWrite(LeftForvard, HIGH);
+  digitalWrite(LeftBack, LOW);
+}
+
+void stop_mashina() { // процедура поворота направо 
+  digitalWrite(RightBack, LOW);
+  digitalWrite(RightForvard, LOW);
+  digitalWrite(LeftForvard, LOW);
+  digitalWrite(LeftBack, LOW);
+}
+
+void prepiatstvia(){  //блок осмотра препятствий
+
+       if (digitalRead(A0)==0){     //0- препятствие. 1- пусто      
+        Serial.println("FULeft");
+        motors_back();
+        delay(1000);
+        right_rotate();
+        delay(100);
+        motors_forward();
+        
+        LCD_COUNT_DIS[COUNT_DIS_ANDLE]=OneWhell*n1 ;// вводим в массив дистанцию до препятствия и угол под которым теперь движется робот
+        COUNT_DIS_ANDLE=COUNT_DIS_ANDLE+1;
+        giro ();
+        LCD_COUNT_ANDLE [COUNT_DIS_ANDLE]=angle; 
+     } 
+     if (digitalRead(A3)==0){   //0- препятствие. 1- пусто
+        Serial.println("FURight");
+        motors_back();
+        delay(1000);
+        left_rotate();
+        delay(100);
+        motors_forward();
+        
+        LCD_COUNT_DIS[COUNT_DIS_ANDLE]=OneWhell*n1 ;
+        COUNT_DIS_ANDLE=COUNT_DIS_ANDLE+1;
+        giro ();
+        LCD_COUNT_ANDLE [COUNT_DIS_ANDLE]=angle;
+
+      }
+      if ((digitalRead(A2)==0)||(digitalRead(A1)==0)){   //0- препятствие. 1- пусто
+        Serial.println("FUCenter");
+        motors_back();
+        delay(1000);
+        right_rotate();
+        delay(100);
+        motors_forward();
+        
+        LCD_COUNT_DIS[COUNT_DIS_ANDLE]=OneWhell*n1 ;
+        COUNT_DIS_ANDLE=COUNT_DIS_ANDLE+1;
+        giro ();
+        LCD_COUNT_ANDLE [COUNT_DIS_ANDLE]=angle;
+      }
+  }
+
+void giro (){  // показания гироскопа (считывание и интегрирование)
+      Wire.beginTransmission(MPU_addr);
+      Wire.write(0x3B);  // starting with register 0x3B (ACCEL_XOUT_H)
+      Wire.endTransmission(false);
+      Wire.requestFrom(MPU_addr,14,true);  // request a total of 14 registers
+      GyZC=Wire.read()<<8|Wire.read();
+      
+      time = millis();
+      real_delta = time - integr_time;
+    if( real_delta > INTEGR_DELAY ){ // интегрирование
+        integr_time = time;
+        gyr_raw = GyZC;
+        aspeed = ((gyr_raw * vref)/adc - vzero)/sens;
+        angle = angle + aspeed * real_delta;
+    }      
+  }
+
+void loop() { 
+  analogWrite(enA, 160);// левый двигатель (устанавливаем скорость 160 из доступного диапазона 0~255)
+  analogWrite(enB, 170);//правый (чтобы ехало ровно) 
+  
+  motors_forward(); // вращаем моторы вперёд
+  if((DistanceY+DistanceX<300)){ // проехал 3 метра по радиусу от начальной точки
+     Serial.println(n1);
+     prepiatstvia();
+    }
+  
+  else {
+      Serial.println(n1);
+      DistanceYNEC=DistanceY;// переменные для сохренения значений  x и y
+      DistanceXNEC=DistanceX;
+      GyzNEC= tan(DistanceYNEC/DistanceXNEC)*180/3.14;//нужный градус в градусах
+      giro ();
+      
+      while((180+GyzNEC) != (angle)){                //блок разворота и движения по радиус вектору
+          right_rotate();
+          delay (50);
+          giro ();
+      }
+      DistanceY=0;
+      DistanceX=0;
+      motors_forward(); 
+      while ((DistanceY=DistanceYNEC)&&(DistanceX=DistanceXNEC)){ // пока не приедешь в исходную точку (по X и Y)
+        delay(500);
+        Serial.println(n1);
+        prepiatstvia();
+        giro ();
+        GyzNEC= tan((DistanceYNEC-DistanceY)/(DistanceXNEC-DistanceX))*180/3.14;//нужный градус в градусах
+        while((180+GyzNEC) != (angle)){                      //блок разворота и движения по радиус вектору
+          right_rotate();
+          delay (50);
+          giro ();
+        }
+        motors_forward();
+        prepiatstvia();
+      }
+    }
+  stop_mashina(); //финальный блок выдачи значений
+  delay(3000);
+   for (OUTPUT_ANDLE_DIS=0;OUTPUT_ANDLE_DIS<COUNT_DIS_ANDLE;OUTPUT_ANDLE_DIS++){
+   lcd.setCursor(0, 0);
+  lcd.print("distanse:");
+  lcd.setCursor(9, 0);
+  lcd.print(LCD_COUNT_DIS[OUTPUT_ANDLE_DIS]);
+  lcd.setCursor(0, 1);
+  lcd.print("andle:");
+  lcd.setCursor(6, 1);
+  lcd.print(LCD_COUNT_ANDLE[OUTPUT_ANDLE_DIS]);
+  delay (5000);
+  lcd.clear();
+   }
+   delay(999999); // время для того чтобы оператор выключил робота для лишь единичного выполнения программы
+}                 // или для повторного запуска
